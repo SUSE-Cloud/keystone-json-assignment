@@ -12,6 +12,7 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+import os
 import yaml
 
 from oslo_config import cfg
@@ -76,6 +77,43 @@ class Assignment(assignment_sql.Assignment):
             'local_id': user_id,
             'entity_type': 'user'})
 
+    def load_user_project_map(self):
+        mtime = os.path.getmtime('/etc/keystone/user-project-map.json')
+        if self.userprojectmap == {} or mtime > self.last_loaded:
+            with open('/etc/keystone/user-project-map.json', 'r') as f:
+                userprojectmap = yaml.load(f)
+                self.last_loaded = mtime
+
+            projectnames = set()
+            for projects in userprojectmap.values():
+                for project in projects:
+                    projectnames.add(project)
+
+            projectidcache = {}
+            for projectname in projectnames:
+                try:
+                    project = self.resource_manager.get_project_by_name(
+                        projectname, CONF.identity.default_domain_id)
+                    projectidcache[projectname] = project['id']
+                except exception.ProjectNotFound as e:
+                    LOG.warning("keystone-json-assignment: "
+                                "project-map: cannot lookup %s: %s",
+                                project, e.message)
+
+            tmp_map = {}
+            for user, projects in userprojectmap.items():
+                projectids = {}
+                projectid = None
+                user_id = self._get_public_id(user)
+                if user_id:
+                    self.useridmap[user_id] = user
+                for projectname in projects:
+                    projectid = projectidcache.get(projectname)
+                    if projectid:
+                        projectids[projectid] = 1
+                tmp_map[user] = projectids
+            self.userprojectmap = tmp_map
+
     def __init__(self):
         self.domain_name = CONF.json_assignment.ldap_domain_name
         self._setup_managers()
@@ -83,48 +121,24 @@ class Assignment(assignment_sql.Assignment):
             self.domain_name, domain_id=None)['id']
         self.role_id = self._get_role_id()
 
-        with open('/etc/keystone/user-project-map.json', 'r') as f:
-            userprojectmap = yaml.load(f)
-
         self.userprojectmap = {}
         self.useridmap = {}
-
-        projectnames = set()
-        for projects in userprojectmap.values():
-            for project in projects:
-                projectnames.add(project)
-
-        projectidcache = {}
-        for projectname in projectnames:
-            try:
-                project = self.resource_manager.get_project_by_name(
-                    projectname, CONF.identity.default_domain_id)
-                projectidcache[projectname] = project['id']
-            except exception.ProjectNotFound as e:
-                LOG.warning("keystone-json-assignment: "
-                            "project-map: cannot lookup %s: %s",
-                            project, e.message)
-
-        for user, projects in userprojectmap.items():
-            projectids = {}
-            projectid = None
-            user_id = self._get_public_id(user)
-            if user_id:
-                self.useridmap[user_id] = user
-            for projectname in projects:
-                projectid = projectidcache.get(projectname)
-                if projectid:
-                    projectids[projectid] = 1
-            self.userprojectmap[user] = projectids
+        self.last_loaded = 0
+        self.load_user_project_map()
 
     def list_grant_role_ids(self, user_id=None, group_id=None,
                             domain_id=None, project_id=None,
                             inherited_to_projects=False):
         """List role ids for assignments/grants."""
+
+        self.load_user_project_map()
+
         role_ids = super(Assignment, self).list_grant_role_ids(
             user_id=user_id, group_id=group_id,
             domain_id=domain_id, project_id=project_id,
             inherited_to_projects=inherited_to_projects)
+
+        self.load_user_project_map()
 
         user = self.useridmap.get(user_id)
         if user and user in self.userprojectmap and \
@@ -142,6 +156,7 @@ class Assignment(assignment_sql.Assignment):
         :returns: None or raises an exception if grant not found
 
         """
+        self.load_user_project_map()
         try:
             super(Assignment, self).check_grant_role_id(
                     role_id, user_id=user_id, group_id=group_id,
@@ -165,6 +180,8 @@ class Assignment(assignment_sql.Assignment):
         assignments attributes need to be filtered on.
 
         """
+        self.load_user_project_map()
+
         role_assignments = super(Assignment, self).list_role_assignments(
              role_id=role_id, user_id=user_id, group_ids=group_ids,
              domain_id=domain_id, project_ids=project_ids,
